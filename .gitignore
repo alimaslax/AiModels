@@ -1,3 +1,18 @@
+.DS_Store
+
+# pth file
+*.pth
+
+# data folder
+data/
+
+# log files
+logs/
+
+# Models
+models
+
+# =================================================================
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[cod]
