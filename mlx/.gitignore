@@ -3,5 +3,6 @@
 /build
 /dist
 /*.egg-info
+mlx_model/
 mlx_models/
 model/
