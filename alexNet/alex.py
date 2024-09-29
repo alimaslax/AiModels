@@ -5,13 +5,13 @@ import torchvision.datasets as datasets
 import torch.optim as optim
 from torch.utils.data import DataLoader
 from tqdm import tqdm
-import matplotlib.pyplot as plt
 import csv
 import time
 import signal
 import sys
 import numpy as np
-import argparse  # Import argparse for command-line argument parsing
+import argparse
+import os
 
 # Define the AlexNet model
 class AlexNet(nn.Module):
@@ -60,11 +60,37 @@ def create_model(model_name='alexnet', num_classes=10):
     else:
         raise ValueError("Model not recognized. Available options: ['alexnet']")
 
+# Function to validate the model
+def validate_model(model, val_loader, criterion):
+    model.eval()
+    val_loss = 0.0
+    val_correct = 0
+    total = 0
+    with torch.no_grad():
+        for images, labels in val_loader:
+            images, labels = images.to('cpu'), labels.to('cpu')
+            outputs = model(images)
+            loss = criterion(outputs, labels)
+            val_loss += loss.item()
+            _, predicted = torch.max(outputs.data, 1)
+            total += labels.size(0)
+            val_correct += (predicted == labels).sum().item()
+    return val_loss / len(val_loader), val_correct / total
+
+# Global variables for epoch and batch
+epoch = 0
+batch_idx = 0
+
 # Function to handle saving the model on Ctrl+C
 def signal_handler(sig, frame):
     print('\nSaving model weights...')
-    torch.save(model.state_dict(), './models/saved_model.pth')
-    print('Model saved as saved_model.pth')
+    torch.save({
+        'epoch': epoch,
+        'batch': batch_idx,
+        'model_state_dict': model.state_dict(),
+        'optimizer_state_dict': optimizer.state_dict(),
+    }, './models/checkpoint.pth')
+    print('Checkpoint saved as checkpoint.pth')
     sys.exit(0)
 
 # Set up signal handling
@@ -72,7 +98,7 @@ signal.signal(signal.SIGINT, signal_handler)
 
 # Argument parser for model loading
 parser = argparse.ArgumentParser()
-parser.add_argument('--model', type=str, help='Path to the model checkpoint to load (e.g., saved_model.pth)')
+parser.add_argument('--model', type=str, help='Path to the model checkpoint to load (e.g., checkpoint.pth)')
 args = parser.parse_args()
 
 # Select model and create it
@@ -80,11 +106,22 @@ model_name = 'alexnet'
 num_classes = 10
 model = create_model(model_name=model_name, num_classes=num_classes)
 
+# Initialize optimizer
+optimizer = optim.Adam(model.parameters(), lr=0.001)
+
+# Variables for resuming training
+start_epoch = 0
+start_batch = 0
+
 # Load pre-trained model if provided
 if args.model:
     try:
-        model.load_state_dict(torch.load(args.model))
-        print(f'Model loaded from {args.model}')
+        checkpoint = torch.load(args.model)
+        model.load_state_dict(checkpoint['model_state_dict'])
+        optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+        start_epoch = checkpoint['epoch']
+        start_batch = checkpoint['batch'] + 1  # Start from the next batch
+        print(f'Resuming from epoch {start_epoch}, batch {start_batch}')
     except Exception as e:
         print(f'Error loading model: {e}')
         sys.exit(1)
@@ -100,20 +137,30 @@ transform = transforms.Compose([
 train_dataset = datasets.CIFAR10(root='./data', train=True, download=True, transform=transform)
 train_loader = DataLoader(dataset=train_dataset, batch_size=32, shuffle=True)
 
-# Loss function and optimizer
+# Create validation dataset and loader
+val_dataset = datasets.CIFAR10(root='./data', train=False, download=True, transform=transform)
+val_loader = DataLoader(dataset=val_dataset, batch_size=32, shuffle=False)
+
+# Loss function
 criterion = nn.CrossEntropyLoss()
-optimizer = optim.Adam(model.parameters(), lr=0.001)
 
 # Prepare to log training statistics
 log_file = 'logs/training_log.csv'
-with open(log_file, mode='w', newline='') as file:
-    writer = csv.writer(file)
-    writer.writerow(['Epoch', 'Batch', 'Loss', 'Training Accuracy', 'Validation Loss', 'Validation Accuracy', 'Time (s)', 'Batches per Second', 'Learning Rate'])
+fieldnames = ['Epoch', 'Batch', 'Loss', 'Training Accuracy', 'Validation Loss', 'Validation Accuracy', 'Time (s)', 'Batches per Second', 'Learning Rate']
+
+if not os.path.exists(log_file):
+    with open(log_file, mode='w', newline='') as file:
+        writer = csv.DictWriter(file, fieldnames=fieldnames)
+        writer.writeheader()
+else:
+    print(f"Appending to existing log file: {log_file}")
 
 # Training loop
 num_epochs = 5
+val_accuracy = 0.0000
+val_loss = 0.0000
 
-for epoch in range(num_epochs):
+for epoch in range(start_epoch, num_epochs):
     model.train()  # Set the model to training mode
     running_loss = 0.0  # Track the loss for this epoch
     running_corrects = 0  # Track correct predictions
@@ -122,7 +169,10 @@ for epoch in range(num_epochs):
     print(f"Start Epoch [{epoch + 1}/{num_epochs}]")
     with tqdm(total=len(train_loader), desc=f"Epoch {epoch + 1}/{num_epochs}", unit='batch') as pbar:
         for batch_idx, (images, labels) in enumerate(train_loader):
-            images, labels = images.to('cpu'), labels.to('cpu')  # Move data to the device if available
+            if epoch == start_epoch and batch_idx < start_batch:
+                continue  # Skip batches that were already processed
+
+            images, labels = images.to('cpu'), labels.to('cpu')  # Move data to the device
 
             # Zero the parameter gradients
             optimizer.zero_grad()
@@ -148,19 +198,43 @@ for epoch in range(num_epochs):
             batches_per_second = (batch_idx + 1) / elapsed_time
             learning_rate = optimizer.param_groups[0]['lr']  # Get the current learning rate
 
-            # Write to log file
+            # Perform validation every 100 batches
+            if (batch_idx + 1) % 100 == 0:
+                val_loss, val_accuracy = validate_model(model, val_loader, criterion)  # Call validate_model
+
+            # Write to log file for training specifics
             with open(log_file, mode='a', newline='') as file:
-                writer = csv.writer(file)
-                writer.writerow([epoch + 1, batch_idx + 1, loss.item(), running_corrects / ((batch_idx + 1) * images.size(0)), '', '', elapsed_time, batches_per_second, learning_rate])
+                writer = csv.DictWriter(file, fieldnames=fieldnames)
+                writer.writerow({
+                    'Epoch': epoch + 1,
+                    'Batch': batch_idx + 1,
+                    'Loss': f"{loss.item():.4f}",
+                    'Training Accuracy': f"{running_corrects / ((batch_idx + 1) * images.size(0)):.4f}",
+                    'Validation Loss': f"{val_loss:.4f}",
+                    'Validation Accuracy': f"{val_accuracy:.4f}",
+                    'Time (s)': f"{elapsed_time:.2f}",
+                    'Batches per Second': f"{batches_per_second:.2f}",
+                    'Learning Rate': f"{learning_rate:.6f}"
+                })
 
     # Print loss and accuracy per epoch
     train_accuracy = running_corrects / len(train_loader.dataset)
     print(f"End Epoch [{epoch + 1}/{num_epochs}], Loss: {running_loss / len(train_loader):.4f}, Training Accuracy: {train_accuracy:.4f}")
 
     # Save the model checkpoint at the end of the epoch
-    torch.save(model.state_dict(), f'alexnet_model_epoch_{epoch + 1}.pth')
+    torch.save({
+        'epoch': epoch + 1,
+        'batch': -1,  # -1 indicates end of epoch
+        'model_state_dict': model.state_dict(),
+        'optimizer_state_dict': optimizer.state_dict(),
+    }, f'alexnet_model_epoch_{epoch + 1}.pth')
     print(f'Model saved as alexnet_model_epoch_{epoch + 1}.pth')
 
 # Save the final model checkpoint
-torch.save(model.state_dict(), 'alexnet_final_model.pth')
+torch.save({
+    'epoch': num_epochs,
+    'batch': -1,
+    'model_state_dict': model.state_dict(),
+    'optimizer_state_dict': optimizer.state_dict(),
+}, 'alexnet_final_model.pth')
 print('Final model saved as alexnet_final_model.pth')
